@@ -10,7 +10,6 @@ import {
   formatCliErrorMessage,
   formatUnexpectedErrorMessage,
 } from "./sensitiveOutput";
-import { checkForUpdate } from "./updateNotifier";
 import { validateCliOptions } from "./validateCliOptions";
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -84,10 +83,9 @@ const disableGpu = !!options.disableGpu;
 const credentialProcess = !!options.credentialProcess;
 const incognito = !!options.incognito;
 
-// Start the update lookup immediately, but only print after the main flow ends.
-const updateCheckPromise = checkForUpdate(version, {
-  useColor: process.stderr.isTTY && !process.env.NO_COLOR,
-});
+// Custom build: the upstream update check would point users at the official
+// release, which lacks login groups, so it is disabled here.
+const updateCheckPromise: Promise<string | null> = Promise.resolve(null);
 
 async function runAsync(): Promise<void> {
   let exitCode = 0;
