@@ -537,6 +537,10 @@ export const login = {
       // issued for an earlier tenant, application, role, or user cannot be
       // returned after the effective profile configuration changes.
       const profile = await this._loadProfileAsync(profileName);
+      const loginGroup = this._getProfileStringValue(
+        profile,
+        "azure_login_group",
+      );
       const run = async (browserLockHeld: boolean): Promise<void> => {
         const wiredToCredentialProcess = this._isManagedByCredentialProcess(
           profile,
@@ -552,6 +556,25 @@ export const login = {
             originalConsoleLog(credentialProcessPayload(cachedCredentials));
             return;
           }
+        }
+
+        if (loginGroup) {
+          await this._loginGroupAsync(profileName, profile, loginGroup, {
+            headless,
+            cliProxy: cliProxy || credentialProcess,
+            disableSandbox,
+            noPrompt: effectiveNoPrompt,
+            enableChromeNetworkService,
+            awsNoVerifySsl,
+            enableChromeSeamlessSso,
+            noDisableExtensions,
+            disableGpu,
+            incognito,
+            credentialProcess,
+            browserLockHeld,
+            printPayload: (payload) => originalConsoleLog(payload),
+          });
+          return;
         }
 
         console.log(
@@ -675,6 +698,21 @@ export const login = {
           () => run(true),
           10 * 60_000,
         );
+      } else if (loginGroup) {
+        // Serialize group refreshes so parallel credential_process calls for
+        // different group members share one browser login.
+        await withFileLock(
+          path.join(
+            paths.az2awsCache,
+            `group-${crypto
+              .createHash("sha256")
+              .update(loginGroup)
+              .digest("hex")
+              .slice(0, 16)}`,
+          ),
+          () => run(false),
+          10 * 60_000,
+        );
       } else {
         await run(false);
       }
@@ -697,26 +735,36 @@ export const login = {
   ): Promise<void> {
     const profiles = await awsConfig.getAz2awsProfileNames();
 
+    const handledGroups = new Set<string>();
     for (const profile of profiles) {
-      debug(`Check if profile ${profile} is expired or is about to expire`);
-      if (!forceRefresh) {
-        // Classic profiles keep credentials in the shared credentials file;
-        // credential_process-wired profiles keep them in the az2aws cache.
-        const rawProfileConfig = await awsConfig.getProfileConfigAsync(profile);
-        const profileConfig = rawProfileConfig
-          ? this._applyProfileEnvironment(rawProfileConfig)
-          : undefined;
-        const usesCredentialProcess =
-          profileConfig !== undefined &&
-          this._isManagedByCredentialProcess(profileConfig, profile);
-        const hasLegacyCredentials =
-          usesCredentialProcess &&
-          (await awsConfig.hasProfileCredentialsAsync(profile));
-        const credentialsFresh = usesCredentialProcess
-          ? !hasLegacyCredentials &&
-            (await credentialCache.isCacheFreshAsync(profile, profileConfig))
-          : !(await awsConfig.isProfileAboutToExpireAsync(profile));
-        if (credentialsFresh) {
+      const rawConfig = await awsConfig.getProfileConfigAsync(profile);
+      const group = rawConfig
+        ? this._getProfileStringValue(
+            this._applyProfileEnvironment(rawConfig),
+            "azure_login_group",
+          )
+        : "";
+      if (group) {
+        // One browser login refreshes the whole group.
+        if (handledGroups.has(group)) continue;
+        handledGroups.add(group);
+        if (!forceRefresh) {
+          const members = await this._getLoginGroupMembersAsync(group);
+          let anyDue = false;
+          for (const member of members) {
+            if (!(await this._isProfileFreshAsync(member.name))) {
+              anyDue = true;
+              break;
+            }
+          }
+          if (!anyDue) {
+            debug(`Login group ${group} not yet due for refresh.`);
+            continue;
+          }
+        }
+      } else {
+        debug(`Check if profile ${profile} is expired or is about to expire`);
+        if (!forceRefresh && (await this._isProfileFreshAsync(profile))) {
           debug(`Profile ${profile} not yet due for refresh.`);
           continue;
         }
@@ -734,6 +782,243 @@ export const login = {
         noDisableExtensions,
         disableGpu,
         incognito,
+      );
+    }
+  },
+
+  /**
+   * True when the profile's credentials stay valid beyond the refresh window.
+   * Classic profiles keep credentials in the shared credentials file;
+   * credential_process-wired profiles keep them in the az2aws cache.
+   */
+  async _isProfileFreshAsync(profile: string): Promise<boolean> {
+    const rawProfileConfig = await awsConfig.getProfileConfigAsync(profile);
+    const profileConfig = rawProfileConfig
+      ? this._applyProfileEnvironment(rawProfileConfig)
+      : undefined;
+    const usesCredentialProcess =
+      profileConfig !== undefined &&
+      this._isManagedByCredentialProcess(profileConfig, profile);
+    const hasLegacyCredentials =
+      usesCredentialProcess &&
+      (await awsConfig.hasProfileCredentialsAsync(profile));
+    return usesCredentialProcess
+      ? !hasLegacyCredentials &&
+          (await credentialCache.isCacheFreshAsync(profile, profileConfig))
+      : !(await awsConfig.isProfileAboutToExpireAsync(profile));
+  },
+
+  /** All profiles whose azure_login_group equals `group`, in config order. */
+  async _getLoginGroupMembersAsync(
+    group: string,
+  ): Promise<{ name: string; profile: ProfileConfig }[]> {
+    const members: { name: string; profile: ProfileConfig }[] = [];
+    for (const name of await awsConfig.getAz2awsProfileNames()) {
+      const raw = await awsConfig.getProfileConfigAsync(name);
+      if (!raw) continue;
+      const profile = this._applyProfileEnvironment(raw);
+      if (this._getProfileStringValue(profile, "azure_login_group") === group) {
+        members.push({ name, profile });
+      }
+    }
+    return members;
+  },
+
+  _samlEndpointForRegion(region: string | undefined): string {
+    if (region && region.startsWith("us-gov")) return AWS_GOV_SAML_ENDPOINT;
+    if (region && region.startsWith("cn-")) return AWS_CN_SAML_ENDPOINT;
+    return AWS_SAML_ENDPOINT;
+  },
+
+  /**
+   * Pick the role for one group member without asking for a duration (the
+   * profile's azure_default_duration_hours is used for every member).
+   */
+  async _pickGroupRoleAsync(
+    profileName: string,
+    roles: Role[],
+    defaultRoleArn: string,
+    noPrompt: boolean,
+  ): Promise<Role> {
+    if (roles.length === 0) {
+      throw new CLIError("No roles found in SAML response.");
+    }
+    if (defaultRoleArn) {
+      const role = roles.find((r) => r.roleArn === defaultRoleArn);
+      if (!role) {
+        throw new CLIError(
+          "Configured default role ARN was not found in the SAML response.",
+        );
+      }
+      return role;
+    }
+    if (roles.length === 1) return roles[0];
+    if (noPrompt) {
+      throw new CLIError(
+        `Profile '${profileName}' has several roles; set azure_default_role_arn for it.`,
+      );
+    }
+    const answers = await inquirer.prompt<{ role: string }>([
+      {
+        name: "role",
+        message: `Role for ${profileName}:`,
+        type: "select",
+        choices: roles.map((r) => r.roleArn).sort(),
+      },
+    ]);
+    const role = roles.find((r) => r.roleArn === answers.role);
+    if (!role) throw new Error("Unable to find role");
+    return role;
+  },
+
+  /**
+   * Sign in to Entra ID once and refresh every profile in the login group
+   * (profiles sharing the same azure_login_group). Each member is its own
+   * Entra enterprise app (azure_app_id_uri) in the same tenant.
+   */
+  async _loginGroupAsync(
+    requestedProfileName: string,
+    requestedProfile: ProfileConfig,
+    group: string,
+    opts: {
+      headless: boolean;
+      cliProxy: boolean;
+      disableSandbox: boolean;
+      noPrompt: boolean;
+      enableChromeNetworkService: boolean;
+      awsNoVerifySsl: boolean;
+      enableChromeSeamlessSso: boolean;
+      noDisableExtensions: boolean;
+      disableGpu: boolean;
+      incognito: boolean;
+      credentialProcess: boolean;
+      browserLockHeld: boolean;
+      printPayload: (payload: string) => void;
+    },
+  ): Promise<void> {
+    const members = await this._getLoginGroupMembersAsync(group);
+    if (!members.some((m) => m.name === requestedProfileName)) {
+      members.unshift({
+        name: requestedProfileName,
+        profile: requestedProfile,
+      });
+    }
+    for (const member of members) {
+      if (!member.profile.azure_tenant_id || !member.profile.azure_app_id_uri) {
+        throw new CLIError(
+          `Profile '${member.name}' is not configured properly.`,
+        );
+      }
+      if (member.profile.azure_tenant_id !== requestedProfile.azure_tenant_id) {
+        throw new CLIError(
+          `Profile '${member.name}' is in login group '${group}' but uses a different azure_tenant_id.`,
+        );
+      }
+    }
+    console.log(
+      `Signing in once for login group '${group}': ${members
+        .map((m) => m.name)
+        .join(", ")}`,
+    );
+
+    const urls: string[] = [];
+    for (const member of members) {
+      urls.push(
+        await this._createLoginUrlAsync(
+          member.profile.azure_app_id_uri,
+          member.profile.azure_tenant_id,
+          this._samlEndpointForRegion(member.profile.region),
+        ),
+      );
+    }
+
+    const samlResponses = await this._performLoginMultiAsync(
+      urls,
+      opts.headless,
+      opts.disableSandbox,
+      opts.cliProxy,
+      opts.noPrompt,
+      opts.enableChromeNetworkService,
+      requestedProfile.azure_default_username,
+      requestedProfile.azure_default_password,
+      opts.enableChromeSeamlessSso,
+      requestedProfile.azure_default_remember_me,
+      opts.noDisableExtensions,
+      opts.disableGpu,
+      opts.incognito,
+      shouldAllowSensitiveOutput(),
+      {
+        browserLockHeld: opts.browserLockHeld,
+        strictNonInteractive: opts.credentialProcess,
+      },
+    );
+
+    const failures: string[] = [];
+    let requestedCredentials: AwsCredentials | undefined;
+    for (let i = 0; i < members.length; i++) {
+      const { name, profile } = members[i];
+      try {
+        const role = await this._pickGroupRoleAsync(
+          name,
+          this._parseRolesFromSamlResponse(samlResponses[i]),
+          profile.azure_default_role_arn,
+          opts.noPrompt,
+        );
+        const durationHours =
+          parseSessionDurationHours(profile.azure_default_duration_hours) ?? 1;
+        const wired = this._isManagedByCredentialProcess(profile, name);
+        const cacheOnly =
+          wired || (opts.credentialProcess && name === requestedProfileName);
+        const credentials = await this._assumeRoleAsync(
+          name,
+          samlResponses[i],
+          role,
+          durationHours,
+          opts.awsNoVerifySsl,
+          profile.region,
+          !cacheOnly,
+        );
+        if (!credentials) {
+          throw new CLIError("Unable to retrieve credentials.");
+        }
+        if (cacheOnly) {
+          const persisted = await credentialCache.setCachedCredentialsAsync(
+            name,
+            credentials,
+            profile,
+          );
+          if (!persisted) {
+            throw new CLIError("Unable to persist the credential cache.");
+          }
+          if (wired) await awsConfig.removeProfileCredentialsAsync(name);
+          if (!opts.credentialProcess) {
+            printCredentialsReadyMessage(name, credentials);
+          }
+        }
+        console.log(`[${name}] Signed in to AWS role ${role.roleArn}.`);
+        if (name === requestedProfileName) requestedCredentials = credentials;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        failures.push(`${name}: ${message}`);
+      }
+    }
+
+    if (opts.credentialProcess) {
+      if (!requestedCredentials) {
+        throw new CLIError(
+          `Unable to retrieve credentials for '${requestedProfileName}'.\n  ${failures.join("\n  ")}`,
+        );
+      }
+      // The AWS CLI only needs this profile; other members' failures are
+      // reported on stderr and retried on their own next call.
+      for (const failure of failures) console.error(`az2aws: ${failure}`);
+      opts.printPayload(credentialProcessPayload(requestedCredentials));
+      return;
+    }
+
+    if (failures.length > 0) {
+      throw new CLIError(
+        `Some profiles in login group '${group}' failed:\n  ${failures.join("\n  ")}`,
       );
     }
   },
@@ -1006,6 +1291,54 @@ export const login = {
     allowSensitiveStateOutput = true,
     context: { browserLockHeld?: boolean; strictNonInteractive?: boolean } = {},
   ): Promise<string> {
+    const [samlResponse] = await this._performLoginMultiAsync(
+      [url],
+      headless,
+      disableSandbox,
+      cliProxy,
+      noPrompt,
+      enableChromeNetworkService,
+      defaultUsername,
+      defaultPassword,
+      enableChromeSeamlessSso,
+      rememberMe,
+      noDisableExtensions,
+      disableGpu,
+      incognito,
+      allowSensitiveStateOutput,
+      context,
+    );
+    return samlResponse;
+  },
+
+  /**
+   * Same as _performLoginAsync, but signs in once and then collects a SAML
+   * response for every URL (one per Entra enterprise app) in the same browser
+   * session, so the Entra session cookie is reused for the later apps.
+   * @returns {Promise.<string[]>} One SAML response per URL, in order.
+   * @private
+   */
+  async _performLoginMultiAsync(
+    urls: string[],
+    headless: boolean,
+    disableSandbox: boolean,
+    cliProxy: boolean,
+    noPrompt: boolean,
+    enableChromeNetworkService: boolean,
+    defaultUsername: string,
+    defaultPassword: string | undefined,
+    enableChromeSeamlessSso: boolean,
+    rememberMe: boolean,
+    noDisableExtensions: boolean,
+    disableGpu: boolean,
+    incognito = false,
+    allowSensitiveStateOutput = true,
+    context: { browserLockHeld?: boolean; strictNonInteractive?: boolean } = {},
+  ): Promise<string[]> {
+    if (urls.length === 0) {
+      throw new Error("No login URLs given");
+    }
+    const url = urls[0];
     debug("Loading login page in Chrome");
 
     let browser: Browser | undefined;
@@ -1015,8 +1348,8 @@ export const login = {
       return withFileLock(
         paths.userDataDir || paths.chromium,
         () =>
-          this._performLoginAsync(
-            url,
+          this._performLoginMultiAsync(
+            urls,
             headless,
             disableSandbox,
             cliProxy,
@@ -1180,13 +1513,22 @@ export const login = {
       await page.setViewport({ width: WIDTH - 15, height: HEIGHT - 35 });
 
       // Prevent redirection to AWS
-      let samlResponseData;
+      let samlResponseData: string | undefined;
+      let resolveSamlResponse: (() => void) | undefined;
+      let samlResponsePromise: Promise<void> = Promise.resolve();
+      const resetSamlCapture = () => {
+        samlResponseData = undefined;
+        samlResponsePromise = new Promise<void>((resolve) => {
+          resolveSamlResponse = resolve;
+        });
+      };
+      resetSamlCapture();
       let hasDetectedCertificateAuth = false;
       const proxyAuthSessions = new WeakMap<
         HTTPRequest["client"],
         Promise<unknown>
       >();
-      const samlResponsePromise = new Promise((resolve) => {
+      {
         page.on("request", (req: HTTPRequest) => {
           const reqURL = req.url();
           const redactedURL = redactUrlForLogs(reqURL);
@@ -1200,8 +1542,8 @@ export const login = {
             reqURL === AWS_GOV_SAML_ENDPOINT ||
             reqURL === AWS_CN_SAML_ENDPOINT
           ) {
-            resolve(undefined);
             samlResponseData = req.postData();
+            resolveSamlResponse?.();
             handleBackgroundPromise(
               req.respond({
                 status: 200,
@@ -1240,7 +1582,7 @@ export const login = {
             );
           }
         });
-      });
+      }
 
       debug("Enabling request interception");
       await page.setRequestInterception(true);
@@ -1248,132 +1590,145 @@ export const login = {
         await authenticateBrowserProxyAsync(page, browserProxy);
       }
 
-      try {
-        if (incognito || headless || cliProxy || browserProxy?.credentials) {
-          debug("Going to login page");
-          await page.goto(url, { waitUntil: "domcontentloaded" });
-        } else {
-          debug("Waiting for login page to load");
-          await page.waitForNavigation({ waitUntil: "networkidle0" });
-        }
-      } catch (err) {
-        if (err instanceof Error) {
-          // An error will be thrown if you're still logged in cause the page.goto ot waitForNavigation
-          // will be a redirect to AWS. That's usually OK
-          debug(
-            `Error occurred during loading the first page: ${formatDebugErrorMessage(err)}`,
-          );
-        }
-      }
-
-      if (cliProxy) {
-        let totalUnrecognizedDelay = 0;
-        let passwordSubmittedAt: number | undefined;
-        let hasPrintedGuiFallbackHint = false;
-        for (;;) {
-          if (samlResponseData) break;
-
+      const samlResponses: string[] = [];
+      for (let urlIndex = 0; urlIndex < urls.length; urlIndex++) {
+        const currentUrl = urls[urlIndex];
+        if (urlIndex > 0) resetSamlCapture();
+        try {
           if (
-            passwordSubmittedAt !== undefined &&
-            !hasPrintedGuiFallbackHint &&
-            !hasDetectedCertificateAuth &&
-            Date.now() - passwordSubmittedAt > GUI_FALLBACK_HINT_DELAY
+            urlIndex > 0 ||
+            incognito ||
+            headless ||
+            cliProxy ||
+            browserProxy?.credentials
           ) {
-            printGuiFallbackHint();
-            hasPrintedGuiFallbackHint = true;
-          }
-
-          let foundState = false;
-          for (let i = 0; i < states.length; i++) {
-            const state = states[i];
-
-            let selected;
-            try {
-              selected = await page.$(state.selector);
-            } catch (err) {
-              if (err instanceof Error) {
-                // An error can be thrown if the page isn't in a good state.
-                // If one occurs, try again after another loop.
-                debug(
-                  `Error when running state "${
-                    state.name
-                  }". ${formatDebugErrorMessage(err)}. Retrying...`,
-                );
-              }
-              break;
-            }
-
-            if (selected) {
-              foundState = true;
-              debug(`Found state: ${state.name}`);
-
-              await Promise.race([
-                samlResponsePromise,
-                state.handler(
-                  page,
-                  selected,
-                  noPrompt,
-                  defaultUsername,
-                  defaultPassword,
-                  useRememberMe,
-                  allowSensitiveStateOutput,
-                  context.strictNonInteractive,
-                ),
-              ]);
-
-              debug(`Finished state: ${state.name}`);
-              if (state.name === "password input") {
-                passwordSubmittedAt = Date.now();
-              }
-
-              break;
-            }
-          }
-
-          if (foundState) {
-            totalUnrecognizedDelay = 0;
+            debug("Going to login page");
+            await page.goto(currentUrl, { waitUntil: "domcontentloaded" });
           } else {
-            debug("State not recognized!");
-            if (totalUnrecognizedDelay > MAX_UNRECOGNIZED_PAGE_DELAY) {
-              if (!allowSensitiveStateOutput) {
-                throw new CLIError(
-                  "Unable to recognize page state in a shared environment. Re-run locally with --mode=debug to capture a screenshot.",
-                );
-              }
-
-              const path = "az2aws-unrecognized-state.png";
-              await page.screenshot({ path });
-              throw new CLIError(
-                `Unable to recognize page state! A screenshot has been dumped to ${path}. If this problem persists, try running with --mode=gui or --mode=debug`,
-              );
-            }
-
-            totalUnrecognizedDelay += DELAY_ON_UNRECOGNIZED_PAGE;
-            await setTimeout(DELAY_ON_UNRECOGNIZED_PAGE);
+            debug("Waiting for login page to load");
+            await page.waitForNavigation({ waitUntil: "networkidle0" });
+          }
+        } catch (err) {
+          if (err instanceof Error) {
+            // An error will be thrown if you're still logged in cause the page.goto ot waitForNavigation
+            // will be a redirect to AWS. That's usually OK
+            debug(
+              `Error occurred during loading the first page: ${formatDebugErrorMessage(err)}`,
+            );
           }
         }
-      } else {
-        console.log("Please complete the login in the opened window");
-        await samlResponsePromise;
+
+        if (cliProxy) {
+          let totalUnrecognizedDelay = 0;
+          let passwordSubmittedAt: number | undefined;
+          let hasPrintedGuiFallbackHint = false;
+          for (;;) {
+            if (samlResponseData) break;
+
+            if (
+              passwordSubmittedAt !== undefined &&
+              !hasPrintedGuiFallbackHint &&
+              !hasDetectedCertificateAuth &&
+              Date.now() - passwordSubmittedAt > GUI_FALLBACK_HINT_DELAY
+            ) {
+              printGuiFallbackHint();
+              hasPrintedGuiFallbackHint = true;
+            }
+
+            let foundState = false;
+            for (let i = 0; i < states.length; i++) {
+              const state = states[i];
+
+              let selected;
+              try {
+                selected = await page.$(state.selector);
+              } catch (err) {
+                if (err instanceof Error) {
+                  // An error can be thrown if the page isn't in a good state.
+                  // If one occurs, try again after another loop.
+                  debug(
+                    `Error when running state "${
+                      state.name
+                    }". ${formatDebugErrorMessage(err)}. Retrying...`,
+                  );
+                }
+                break;
+              }
+
+              if (selected) {
+                foundState = true;
+                debug(`Found state: ${state.name}`);
+
+                await Promise.race([
+                  samlResponsePromise,
+                  state.handler(
+                    page,
+                    selected,
+                    noPrompt,
+                    defaultUsername,
+                    defaultPassword,
+                    useRememberMe,
+                    allowSensitiveStateOutput,
+                    context.strictNonInteractive,
+                  ),
+                ]);
+
+                debug(`Finished state: ${state.name}`);
+                if (state.name === "password input") {
+                  passwordSubmittedAt = Date.now();
+                }
+
+                break;
+              }
+            }
+
+            if (foundState) {
+              totalUnrecognizedDelay = 0;
+            } else {
+              debug("State not recognized!");
+              if (totalUnrecognizedDelay > MAX_UNRECOGNIZED_PAGE_DELAY) {
+                if (!allowSensitiveStateOutput) {
+                  throw new CLIError(
+                    "Unable to recognize page state in a shared environment. Re-run locally with --mode=debug to capture a screenshot.",
+                  );
+                }
+
+                const path = "az2aws-unrecognized-state.png";
+                await page.screenshot({ path });
+                throw new CLIError(
+                  `Unable to recognize page state! A screenshot has been dumped to ${path}. If this problem persists, try running with --mode=gui or --mode=debug`,
+                );
+              }
+
+              totalUnrecognizedDelay += DELAY_ON_UNRECOGNIZED_PAGE;
+              await setTimeout(DELAY_ON_UNRECOGNIZED_PAGE);
+            }
+          }
+        } else {
+          console.log("Please complete the login in the opened window");
+          await samlResponsePromise;
+        }
+
+        if (!samlResponseData) {
+          throw new Error("SAML response not found");
+        }
+
+        const samlResponse = querystring.parse(samlResponseData).SAMLResponse;
+
+        if (!samlResponse) {
+          throw new Error("SAML response not found");
+        } else if (Array.isArray(samlResponse)) {
+          throw new Error("SAML can't be an array");
+        }
+
+        debug("Found SAML response", {
+          base64Length: samlResponse.length,
+        });
+
+        samlResponses.push(samlResponse);
       }
 
-      if (!samlResponseData) {
-        throw new Error("SAML response not found");
-      }
-
-      const samlResponse = querystring.parse(samlResponseData).SAMLResponse;
-
-      if (!samlResponse) {
-        throw new Error("SAML response not found");
-      } else if (Array.isArray(samlResponse)) {
-        throw new Error("SAML can't be an array");
-      }
-
-      debug("Found SAML response", {
-        base64Length: samlResponse.length,
-      });
-
-      return samlResponse;
+      return samlResponses;
     } finally {
       try {
         if (browser) await browser.close();
